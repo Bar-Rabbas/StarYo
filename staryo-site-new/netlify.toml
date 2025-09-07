@@ -1,0 +1,20 @@
+[functions]
+  directory = "netlify/functions"
+
+[[redirects]]
+  # Proxy for nano remove
+  from = "/api/nano/remove"
+  to = "/.netlify/functions/nano-remove"
+  status = 200
+
+[[redirects]]
+  # Proxy for nano insert
+  from = "/api/nano/insert"
+  to = "/.netlify/functions/nano-insert"
+  status = 200
+
+[[redirects]]
+  # Proxy for animation
+  from = "/api/animate"
+  to = "/.netlify/functions/animate"
+  status = 200
