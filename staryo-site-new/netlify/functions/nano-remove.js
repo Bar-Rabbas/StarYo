@@ -1,132 +1,77 @@
 // Netlify Function: nano-remove
-// Receives a JSON payload with a base64-encoded image and an optional instruction.
-// Uses the Gemini (Google generative language) API to remove an object from the image
-// according to the instruction. Responds with a JSON object containing the base64
-// encoded result image (without any data URI prefix).
+// Removes objects from an image using upstream Nano Banana API.
 
-exports.handler = async function(event, context) {
-  // Determine the allowed origin from env or default to *.
-  const allowOrigin = process.env.ALLOW_ORIGIN || '*';
-  // Define a common set of CORS headers for all responses.
-  const corsHeaders = {
-    'Access-Control-Allow-Origin': allowOrigin,
-    // Allow typical content-type header; extend as needed for other headers.
-    'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  };
+const allowOrigin = process.env.ALLOW_ORIGIN || '*';
+const corsHeaders = {
+  'Access-Control-Allow-Origin': allowOrigin,
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS'
+};
 
-  // Handle CORS preflight
+const ok = (data, took = 0) => ({
+  statusCode: 200,
+  headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ ok: true, result: data, meta: { took_ms: took } })
+});
+
+const fail = (code, err) => ({
+  statusCode: code,
+  headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ ok: false, error: err })
+});
+
+exports.handler = async function(event) {
   if (event.httpMethod === 'OPTIONS') {
-    return {
-      statusCode: 204,
-      headers: corsHeaders,
-      body: ''
-    };
+    return { statusCode: 204, headers: corsHeaders, body: '' };
   }
+
+  if (event.httpMethod !== 'POST') {
+    return fail(405, { code: 'METHOD_NOT_ALLOWED' });
+  }
+
+  const started = Date.now();
   try {
-    // Ensure POST
-    if (event.httpMethod !== 'POST') {
-      return {
-        statusCode: 405,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'Method not allowed' }),
-      };
+    const { image, prompt = 'remove test', strength = 0.85 } = JSON.parse(event.body || '{}');
+    if (!image) return fail(400, { code: 'BAD_INPUT', message: 'image required' });
+
+    const base64 = image.startsWith('data:')
+      ? image.split(',')[1]
+      : (image.startsWith('http') ? null : image);
+
+    const upstreamUrl = process.env.NANO_API_URL;
+    const headers = { 'Content-Type': 'application/json' };
+    if (process.env.NANO_API_KEY) {
+      headers['Authorization'] = `Bearer ${process.env.NANO_API_KEY}`;
     }
-    const body = event.body ? JSON.parse(event.body) : {};
-    const { image, instruction } = body;
-    if (!image) {
-      return {
-        statusCode: 400,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'Missing image' }),
-      };
-    }
-    const apiKey = process.env.NANO_API_KEY;
-    const model = process.env.NANO_MODEL || 'gemini-2.5-flash-image-preview';
-    if (!apiKey) {
-      return {
-        statusCode: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'NANO_API_KEY not set' }),
-      };
-    }
-    // Extract base64 data and MIME type
-    let base64Data = image;
-    let mime = 'image/jpeg';
-    const dataUriMatch = /^data:(.*?);base64,(.*)$/.exec(image);
-    if (dataUriMatch) {
-      mime = dataUriMatch[1];
-      base64Data = dataUriMatch[2];
-    } else {
-      // If the string is raw base64, keep as is
-      base64Data = image;
-    }
-    const prompt = instruction || 'remove unwanted objects from the image';
-    // Build Gemini request payload
-    const geminiBody = {
-      contents: [
-        {
-          parts: [
-            { text: prompt },
-            {
-              inline_data: {
-                mime_type: mime,
-                data: base64Data,
-              },
-            },
-          ],
-        },
-      ],
-    };
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-    const response = await fetch(url, {
+
+    const payload = base64
+      ? { image_base64: base64, prompt, strength }
+      : { image_url: image, prompt, strength };
+
+    console.log('nano-remove payload', { ...payload, image_base64: payload.image_base64 ? '<omitted>' : undefined });
+
+    const res = await fetch(upstreamUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
-      },
-      body: JSON.stringify(geminiBody),
+      headers,
+      body: JSON.stringify(payload)
     });
-    if (!response.ok) {
-      const text = await response.text();
-      return {
-        statusCode: response.status,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'Gemini API error', details: text }),
-      };
+    const text = await res.text();
+    console.log('nano-remove upstream status', res.status);
+
+    if (!res.ok) {
+      return fail(res.status, {
+        code: 'UPSTREAM_ERROR',
+        message: 'Upstream returned error',
+        upstream: { status: res.status, body: text }
+      });
     }
-    const result = await response.json();
-    // Find the first image in the response
-    let outData;
-    const candidates = result?.candidates;
-    if (Array.isArray(candidates) && candidates.length > 0) {
-      const parts = candidates[0]?.content?.parts;
-      if (Array.isArray(parts)) {
-        for (const part of parts) {
-          if (part.inline_data && part.inline_data.data) {
-            outData = part.inline_data.data;
-            break;
-          }
-        }
-      }
-    }
-    if (!outData) {
-      return {
-        statusCode: 502,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'No image returned from Gemini' }),
-      };
-    }
-    return {
-      statusCode: 200,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ data: outData }),
-    };
-  } catch (err) {
-    return {
-      statusCode: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ error: err.message || err.toString() }),
-    };
+
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+    return ok(data, Date.now() - started);
+  } catch (e) {
+    console.error('nano-remove error', e);
+    return fail(500, { code: 'UNEXPECTED', message: e.message || String(e) });
   }
 };
